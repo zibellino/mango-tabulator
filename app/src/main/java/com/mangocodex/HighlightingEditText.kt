@@ -1,0 +1,291 @@
+package com.mangocodex
+
+import android.content.Context
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.Rect
+import android.graphics.RectF
+import android.text.Editable
+import android.text.Layout
+import android.text.Spannable
+import android.text.TextWatcher
+import android.text.style.ForegroundColorSpan
+import androidx.appcompat.widget.AppCompatEditText
+import androidx.compose.ui.graphics.toArgb
+
+/**
+ * Plain multi-line EditText used as the code surface, deliberately NOT hosted inside
+ * Compose's BasicTextField.
+ *
+ * Android's TextView/EditText backs its content with a DynamicLayout, which - unlike
+ * Compose's Paragraph/MultiParagraph - only re-measures the changed line block on an
+ * edit rather than the whole document, and its draw path already clips against the
+ * Canvas clip rect so off-screen lines aren't repainted on scroll. Cursor blink and
+ * selection are invalidated via small dirty rects owned by the platform widget, not a
+ * shared draw scope covering the whole field, so there's no need for a hand-rolled
+ * cursor overlay here - the built-in one already behaves the way we want.
+ */
+class HighlightingEditText(context: Context) : AppCompatEditText(context) {
+
+    /** Fired with the full text on every real (user-driven) edit, plus the raw edit
+     *  region (start, before, count) so listeners can incrementally adjust their own
+     *  offset-based state (e.g. find-match ranges) instead of invalidating it. */
+    var onTextChangedListener: ((newText: String, start: Int, before: Int, count: Int) -> Unit)? = null
+
+    /**
+     * When enabled, pressing Enter copies all leading whitespace (spaces/tabs) from
+     * the line being split onto the newly created line, so typing continues at the
+     * same indentation instead of resetting to column 0.
+     */
+    var autoIndentEnabled: Boolean = true
+
+    // Guards the watcher against reacting to changes we make ourselves (span
+    // application, programmatic setText, auto-indent insertion) so those never
+    // bounce back into the ViewModel as if the user had typed them.
+    private var suppressWatcher = false
+
+    // Computed in onTextChanged (before the edit is committed to the Editable) and
+    // consumed in afterTextChanged (once it's safe to mutate the Editable again).
+    private var pendingAutoIndent: String? = null
+    private var pendingAutoIndentPos: Int = -1
+
+    // The raw edit region reported by this pass through onTextChanged, forwarded to
+    // onTextChangedListener so listeners can shift their own offsets incrementally.
+    private var pendingEditStart: Int = 0
+    private var pendingEditBefore: Int = 0
+    private var pendingEditCount: Int = 0
+
+    init {
+        addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                pendingAutoIndent = null
+                pendingEditStart = start
+                pendingEditBefore = before
+                pendingEditCount = count
+                if (suppressWatcher || !autoIndentEnabled) return
+                // Only trigger on a plain single-character newline insertion (a real
+                // Enter keypress) - not on multi-line paste or deletions - so we don't
+                // second-guess content the user explicitly provided.
+                if (s == null || count != 1 || before != 0) return
+                if (s[start] != '\n') return
+
+                var lineStart = start
+                while (lineStart > 0 && s[lineStart - 1] != '\n') lineStart--
+
+                val whitespace = StringBuilder()
+                var i = lineStart
+                while (i < start && (s[i] == ' ' || s[i] == '\t')) {
+                    whitespace.append(s[i])
+                    i++
+                }
+                if (whitespace.isNotEmpty()) {
+                    pendingAutoIndent = whitespace.toString()
+                    pendingAutoIndentPos = start + 1
+                }
+            }
+
+            override fun afterTextChanged(s: Editable?) {
+                if (suppressWatcher) return
+
+                val indent = pendingAutoIndent
+                val pos = pendingAutoIndentPos
+                pendingAutoIndent = null
+                if (indent != null && s != null && pos in 0..s.length) {
+                    suppressWatcher = true
+                    try {
+                        s.insert(pos, indent)
+                        setSelection(pos + indent.length)
+                    } finally {
+                        suppressWatcher = false
+                    }
+                    // The auto-indent insert is a second, contiguous edit right after
+                    // the original one (same start, no deletion) - fold its length in
+                    // so listeners see one combined edit region rather than missing
+                    // the extra characters entirely.
+                    pendingEditCount += indent.length
+                }
+
+                onTextChangedListener?.invoke(
+                    s?.toString().orEmpty(),
+                    pendingEditStart,
+                    pendingEditBefore,
+                    pendingEditCount
+                )
+            }
+        })
+    }
+
+    /**
+     * Replaces all foreground-color spans across the document with [spans]. Spans are
+     * only ever added for the current styled window (see EditorViewModel), so the set
+     * being cleared/reapplied here is bounded by that window, not by document length.
+     */
+    fun applyHighlightSpans(spans: List<HighlightSpan>) {
+        val editable = text ?: return
+        val length = editable.length
+
+        suppressWatcher = true
+        try {
+            val existing = editable.getSpans(0, length, ForegroundColorSpan::class.java)
+            for (span in existing) editable.removeSpan(span)
+
+            for (s in spans) {
+                val start = s.start.coerceIn(0, length)
+                val end = s.end.coerceIn(0, length)
+                if (start >= end) continue
+                editable.setSpan(
+                    ForegroundColorSpan(s.color.toArgb()),
+                    start,
+                    end,
+                    Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
+                )
+            }
+        } finally {
+            suppressWatcher = false
+        }
+    }
+
+    /** Sets text programmatically (file load/new/pattern switch) without notifying the listener. */
+    fun setTextSilently(newText: String) {
+        suppressWatcher = true
+        try {
+            setText(newText)
+            setSelection(0)
+        } finally {
+            suppressWatcher = false
+        }
+    }
+
+    /** Selects [range] (used to highlight the current find match via native selection). */
+    fun selectRange(range: IntRange) {
+        val length = text?.length ?: return
+        val start = range.first.coerceIn(0, length)
+        val end = (range.last + 1).coerceIn(0, length)
+        requestFocus()
+        setSelection(start, end)
+    }
+
+    /**
+     * Disables the platform TextView's own "scroll the nearest scrollable ancestor to
+     * reveal the cursor" behavior. That logic runs on focus gain - i.e. as soon as a
+     * tap lands, before ACTION_UP has moved the selection to the tapped offset - so it
+     * scrolls the outer ScrollView to wherever the selection *previously* was (offset
+     * 0 right after a file load) rather than where the user just tapped, producing a
+     * visible snap-to-top on every tap-to-focus. Scrolling is already fully owned by
+     * CodeEditorView (see scrollToOffset/revealMatch), so it's safe to just no-op this.
+     */
+    override fun bringPointIntoView(offset: Int): Boolean = false
+
+    override fun onFocusChanged(focused: Boolean, direction: Int, previouslyFocusedRect: Rect?) {
+        super.onFocusChanged(focused, direction, previouslyFocusedRect)
+        if (!focused && selectionStart != selectionEnd) {
+            // Collapse any active selection when focus leaves the editor, so the
+            // "current match" native highlight doesn't linger once you tap away - it
+            // should look identical to every other match (border only, see
+            // applyMatchBorders) until Next is pressed again.
+            setSelection(selectionStart)
+        }
+    }
+
+    // Match ranges to outline, and the paint used to stroke them - see
+    // applyMatchBorders for why this is a custom onDraw pass rather than a Span.
+    private var matchBorderRanges: List<IntRange> = emptyList()
+    private val matchBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2f
+    }
+    private val matchBorderRadius = 2f * resources.displayMetrics.density
+
+    // Precomputed rectangles for the current matchBorderRanges, rebuilt only when the
+    // match set or the text layout actually changes - not on every single onDraw call
+    // (which happens far more often than that, e.g. on every cursor blink). Each
+    // rectangle costs a handful of Layout queries to compute; redoing that for every
+    // match on every frame, rather than once per real change, was the actual source
+    // of visible lag while typing in a file with many matches.
+    private var cachedMatchBorderRects: List<RectF>? = null
+    private var cachedMatchBorderLayout: Layout? = null
+
+    /**
+     * Sets the match ranges to outline with a thin rectangle - every match gets this,
+     * including the current one (which also gets the native text selection on top
+     * while focused). Drawn per *visual* line (see [buildMatchBorderRects]) so a
+     * match that word-wraps renders as two distinct boxes - one per line segment -
+     * rather than one box straddling the wrap point the way a Span-based approach
+     * would.
+     */
+    fun applyMatchBorders(ranges: List<IntRange>, borderColor: Int) {
+        matchBorderRanges = ranges
+        matchBorderPaint.color = borderColor
+        cachedMatchBorderRects = null // force a rebuild against the new ranges
+        invalidate()
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val currentLayout = layout
+        if (currentLayout != null && matchBorderRanges.isNotEmpty()) {
+            var rects = cachedMatchBorderRects
+            if (rects == null || cachedMatchBorderLayout !== currentLayout) {
+                rects = buildMatchBorderRects(currentLayout)
+                cachedMatchBorderRects = rects
+                cachedMatchBorderLayout = currentLayout
+            }
+            for (rect in rects) {
+                canvas.drawRoundRect(rect, matchBorderRadius, matchBorderRadius, matchBorderPaint)
+            }
+        }
+    }
+
+    /** Computes one rectangle per visual line that each match range touches. */
+    private fun buildMatchBorderRects(layout: Layout): List<RectF> {
+        val content = text ?: return emptyList()
+        val length = content.length
+        // These are the same offsets TextView itself uses to translate Layout-space
+        // coordinates into this view's onDraw canvas space.
+        val offsetX = totalPaddingLeft.toFloat()
+        val offsetY = totalPaddingTop.toFloat()
+        val fontMetrics = paint.fontMetricsInt
+        val rects = ArrayList<RectF>(matchBorderRanges.size)
+
+        for (range in matchBorderRanges) {
+            val start = range.first.coerceIn(0, length)
+            val end = (range.last + 1).coerceIn(0, length)
+            if (start >= end) continue
+
+            val firstLine = layout.getLineForOffset(start)
+            val lastLine = layout.getLineForOffset(end - 1)
+
+            for (line in firstLine..lastLine) {
+                val lineStart = layout.getLineStart(line)
+                val lineEnd = layout.getLineEnd(line)
+                val segStart = start.coerceAtLeast(lineStart)
+                val segEnd = end.coerceAtMost(lineEnd)
+                if (segStart >= segEnd) continue
+
+                val left = layout.getPrimaryHorizontal(segStart)
+                // getPrimaryHorizontal(segEnd) is ambiguous whenever segEnd lands
+                // exactly on the boundary shared by this line's end and the next
+                // line's start (which happens whenever the segment runs up to and
+                // includes a trailing '\n', or ends at a soft-wrap point) - it can
+                // resolve to the *next* line's context and return 0 there, producing
+                // a bogus near-zero-width box back at the start of THIS line instead
+                // of one ending at its actual right edge. Anchoring on segEnd - 1
+                // (always strictly inside this line, so unambiguous) plus that one
+                // character's own measured width sidesteps the boundary entirely.
+                val right = layout.getPrimaryHorizontal(segEnd - 1) + paint.measureText(content, segEnd - 1, segEnd)
+                // Sized off font metrics around the baseline (not getLineTop/
+                // getLineBottom directly), since those include the extra inter-line
+                // spacing set on this EditText - using them would make the box taller
+                // than the glyphs and leave a visible gap at the bottom.
+                val baseline = layout.getLineBaseline(line)
+                val top = baseline + fontMetrics.ascent
+                val bottom = baseline + fontMetrics.descent
+
+                rects.add(RectF(offsetX + left, offsetY + top, offsetX + right, offsetY + bottom))
+            }
+        }
+        return rects
+    }
+}
